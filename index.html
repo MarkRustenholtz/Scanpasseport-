@@ -1,0 +1,213 @@
+<!doctype html>
+
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Scanner MRZ - Passeport (démo)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:12px}
+    video,canvas{max-width:100%;border:1px solid #ccc;border-radius:6px}
+    .controls{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+    pre{background:#111;color:#0f0;padding:8px;border-radius:6px;overflow:auto}
+    .result{margin-top:8px}
+    .warn{color:#a00}
+  </style>
+</head>
+<body>
+  <h1>Scanner MRZ - Passeport (démo)</h1>
+  <p>Ce fichier est une démo locale : ouvre-le sur un serveur (ou via Live Server) et autorise la caméra. N'utilise pas pour collecter des données sans consentement.</p><video id="video" playsinline autoplay></video> <canvas id="canvas" style="display:none"></canvas>
+
+  <div class="controls">
+    <button id="startBtn">Démarrer caméra</button>
+    <button id="snapBtn">Prendre photo & extraire MRZ</button>
+    <button id="uploadBtn">Choisir image</button>
+    <input id="fileInput" type="file" accept="image/*" style="display:none">
+  </div>  <div class="result">
+    <h3>OCR brut (quelques dernières lignes)</h3>
+    <pre id="ocrOut">—</pre><h3>MRZ détectée (nettoyée)</h3>
+<pre id="mrzOut">—</pre>
+
+<h3>Données parsées</h3>
+<pre id="dataOut">—</pre>
+
+<div class="warn">Attention : respectez la vie privée et la législation locale avant d'utiliser ce script en production.</div>
+
+  </div>  <!-- Tesseract.js CDN -->  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.min.js"></script>  <script>
+  // Utilisation : script simple qui capture une image, recadre la zone inférieure (où se trouve
+  // typiquement la MRZ sur un passeport) puis lance Tesseract pour l'OCR. Ensuite on essaie d'extraire
+  // les deux lignes MRZ et on les parse avec une fonction simple.
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const startBtn = document.getElementById('startBtn');
+  const snapBtn = document.getElementById('snapBtn');
+  const fileInput = document.getElementById('fileInput');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const ocrOut = document.getElementById('ocrOut');
+  const mrzOut = document.getElementById('mrzOut');
+  const dataOut = document.getElementById('dataOut');
+
+  let stream;
+
+  startBtn.onclick = async () => {
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+      video.srcObject = stream;
+      await video.play();
+    }catch(e){alert('Erreur accès caméra: '+e.message)}
+  }
+
+  uploadBtn.onclick = ()=> fileInput.click();
+  fileInput.onchange = ()=>{
+    const f = fileInput.files[0];
+    if(!f) return;
+    const url = URL.createObjectURL(f);
+    loadImageFromURL(url);
+  }
+
+  snapBtn.onclick = async ()=>{
+    if(video.readyState < 2){
+      alert('Démarrez d\u2019abord la caméra ou uploadez une image.');
+      return;
+    }
+    // Capture full frame
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video,0,0);
+    // recadrage heuristique : zone inférieure 25% hauteur x 95% largeur centrée
+    const cropH = Math.floor(canvas.height * 0.25);
+    const cropW = Math.floor(canvas.width * 0.95);
+    const sx = Math.floor((canvas.width - cropW)/2);
+    const sy = canvas.height - cropH - Math.floor(canvas.height*0.02); // petit offset
+    const tmp = document.createElement('canvas');
+    tmp.width = cropW; tmp.height = cropH;
+    tmp.getContext('2d').drawImage(canvas, sx, sy, cropW, cropH, 0,0, cropW, cropH);
+
+    await runOCR(tmp);
+  }
+
+  async function loadImageFromURL(url){
+    const img = new Image();
+    img.onload = async ()=>{
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img,0,0);
+      // Même recadrage heuristique
+      const cropH = Math.floor(canvas.height * 0.25);
+      const cropW = Math.floor(canvas.width * 0.95);
+      const sx = Math.floor((canvas.width - cropW)/2);
+      const sy = canvas.height - cropH - Math.floor(canvas.height*0.02);
+      const tmp = document.createElement('canvas');
+      tmp.width = cropW; tmp.height = cropH;
+      tmp.getContext('2d').drawImage(canvas, sx, sy, cropW, cropH, 0,0, cropW, cropH);
+      await runOCR(tmp);
+    }
+    img.onerror = ()=>alert('Impossible de charger l\u2019image');
+    img.src = url;
+  }
+
+  async function runOCR(canvasEl){
+    ocrOut.textContent = 'Traitement OCR...';
+    mrzOut.textContent = '...';
+    dataOut.textContent = '...';
+
+    // Convert canvas to blob to give to Tesseract
+    const blob = await new Promise(res=>canvasEl.toBlob(res,'image/jpeg',0.9));
+
+    // Tesseract - configure pour lire caractères OCR-B / MRZ : on peut forcer langage 'eng' mais
+    // pour de meilleurs résultats il est possible d'utiliser un traineddata spécialisé en OCRB.
+    const worker = Tesseract.createWorker({
+      logger: m=>console.log(m)
+    });
+
+    await worker.load();
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+    // options pour améliorer : whitelist des caractères MRZ
+    await worker.setParameters({tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<'});
+
+    const { data } = await worker.recognize(blob);
+    await worker.terminate();
+
+    const lines = data.text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    ocrOut.textContent = lines.slice(-10).join('\n');
+
+    // Tenter d'extraire 2 ou 3 lignes MRZ
+    const mrzLines = findMrzLines(lines.join('\n'));
+    if(!mrzLines){
+      mrzOut.textContent = 'Aucune MRZ fiable trouvée. (Essayez de recadrer / améliorer la photo)';
+      dataOut.textContent = '-';
+      return;
+    }
+    mrzOut.textContent = mrzLines.join('\n');
+    const parsed = parsePassportMrz(mrzLines);
+    dataOut.textContent = JSON.stringify(parsed,null,2);
+  }
+
+  function findMrzLines(text){
+    // Nettoyage simple : garder uniquement lettres, chiffres et '<' et retours à la ligne
+    const cleaned = text.toUpperCase().replace(/[^A-Z0-9<>\n\r]/g,'');
+    const candidateLines = cleaned.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+
+    // Chercher des lignes de longueur 44 (passeport standard : 2 lignes de 44)
+    const len44 = candidateLines.filter(l=>l.length>=40 && l.length<=44);
+    if(len44.length>=2){
+      // Prendre les deux dernières lignes parmi celles-ci
+      const lastTwo = len44.slice(-2).map(l=>padMrzLine(l));
+      return lastTwo;
+    }
+    // fallback: chercher 3 lignes de longueur 30 (ID cards)
+    const len30 = candidateLines.filter(l=>l.length>=26 && l.length<=30);
+    if(len30.length>=3){
+      const lastThree = len30.slice(-3).map(l=>padMrzLine(l,30));
+      return lastThree;
+    }
+    return null;
+  }
+
+  function padMrzLine(line, expected=44){
+    // MRZ uses '<' as filler, ensure length
+    if(line.length===expected) return line;
+    if(line.length>expected) return line.slice(0,expected);
+    return line + '<'.repeat(expected-line.length);
+  }
+
+  function parsePassportMrz(lines){
+    // Supporte MRZ type P (2 lignes de 44 chars)
+    if(!lines || lines.length<2) return {error:'MRZ non fournie'};
+    const l1 = lines[0];
+    const l2 = lines[1];
+    if(l1.length!==44 || l2.length!==44) return {error:'Format MRZ inattendu'};
+
+    const docType = l1.slice(0,1);
+    const issuing = l1.slice(2,5);
+    // names: après 5e caractère, noms et prénoms séparés par <<
+    const namesRaw = l1.slice(5).replace(/<+$/,'');
+    const [surname, given] = namesRaw.split('<<');
+
+    const passportNumber = l2.slice(0,9).replace(/<+$/,'');
+    const passportCheck = l2.slice(9,10);
+    const nationality = l2.slice(10,13);
+    const birth = l2.slice(13,19);
+    const birthCheck = l2.slice(19,20);
+    const sex = l2.slice(20,21);
+    const expiry = l2.slice(21,27);
+    const expiryCheck = l2.slice(27,28);
+    const personalNumber = l2.slice(28,42).replace(/<+$/,'');
+    const personalCheck = l2.slice(42,43);
+
+    return {
+      docType, issuing,
+      surname: surname ? surname.replace(/</g,' ').trim() : '',
+      givenNames: given ? given.replace(/</g,' ').trim() : '',
+      passportNumber, passportCheck,
+      nationality, birth, birthCheck,
+      sex, expiry, expiryCheck, personalNumber, personalCheck
+    };
+  }
+
+  </script></body>
+</html>
